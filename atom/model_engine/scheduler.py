@@ -10,7 +10,7 @@ from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
-
+from atom.disaggregation.kv_connector import MORIIO_KV_CONNECTOR
 logger = logging.getLogger("atom")
 
 
@@ -58,6 +58,8 @@ class ScheduledBatch:
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
 
+  
+            
 
 class Scheduler:
 
@@ -69,7 +71,14 @@ class Scheduler:
         self.block_manager = BlockManager(config)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
-
+        
+        # Use a temporary deque to collect requests that need to be skipped
+        # and put back at the head of the waiting queue later
+        self.kv_connector=None
+        if True:
+            config=None
+            self.kv_connector = MORIIO_KV_CONNECTOR(config)
+            
     def is_finished(self):
         return not self.waiting and not self.running
 
@@ -84,21 +93,53 @@ class Scheduler:
         scheduled_seqs = {}
         num_seqs_prefill = 0
         num_batched_tokens = 0
-
+        skipped_waiting_requests: deque[Sequence] = deque()
         num_scheduled_tokens: list[int] = []
 
         if not self.running and not self.waiting:
             # self.block_manager.reset()
             return None
 
+        #todo here
         while self.waiting and num_seqs_prefill < self.max_num_seqs:
             seq = self.waiting[0]
+            
+            
+            # KVTransfer: skip request if still waiting for remote kvs.
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                is_ready = self._update_waiting_for_remote_kv(seq)
+                if is_ready:
+                    seq.status = SequenceStatus.WAITING
+                else:
+                    self.waiting.popleft()
+                    skipped_waiting_requests.add(seq)
+                continue
+            
+            
+            load_kv_async = False
+            if self.kv_connector is not None:
+                
+                #
+                ext_tokens, load_kv_async = self.kv_connector.get_num_new_matched_tokens(seq)
+                    
+
+           
+            if load_kv_async:
+                # If loading async, allocate memory and put request
+                # into the WAITING_FOR_REMOTE_KV state.
+                skipped_waiting_requests.appendleft(seq)
+                seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                continue
+
+                
+            
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
                 num_batched_tokens + num_new_tokens > self.max_num_batched_tokens
                 or not self.block_manager.can_allocate(seq)
             ):
                 break
+            
             num_seqs_prefill += 1
             self.block_manager.allocate(seq)
             num_batched_tokens += num_new_tokens
@@ -248,3 +289,36 @@ class Scheduler:
             self.block_manager.deallocate(seq)
             self.running.remove(seq)
         return finished_seqs
+    
+
+def _update_waiting_for_remote_kv(self, seq) -> bool:
+        """
+        P/D: check if the request_id is finished_recving.
+        The finished_recving_kv_req_ids list is populated
+        on the previous steps()'s update_from_output based
+        on the worker side connector.
+        When the kv transfer is ready, we cache the blocks
+        and the request state will be moved back to WAITING from
+        WAITING_FOR_REMOTE_KV.
+        """
+        # if seq.request_id not in self.finished_recving_kv_req_ids:
+        #     return False
+
+        # # Now that the blocks are ready, actually cache them.
+        # block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+        
+        
+        # num_computed_tokens = len(block_ids) * self.block_size
+        # if num_computed_tokens == request.num_tokens:
+        #     num_computed_tokens -= 1
+        # self.kv_cache_manager.single_type_manager.cache_blocks(
+        #     request,
+        #     self.kv_cache_manager.req_to_block_hashes[request.request_id],
+        #     num_computed_tokens,
+        # )
+        # # Update the request state for scheduling.
+        # request.num_computed_tokens = num_computed_tokens
+
+        # # Return that we are ready.
+        # self.finished_recving_kv_req_ids.remove(req.request_id)
+        return True

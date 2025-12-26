@@ -10,6 +10,7 @@ from atom.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
+    WAITING_FOR_REMOTE_KVS = auto()
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
