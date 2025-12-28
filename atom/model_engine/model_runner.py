@@ -465,6 +465,7 @@ class ModelRunner:
         logger.debug(
             f"{self.label}: dummy batch executed with {num_input_tokens} tokens"
         )
+        #TODO , get connector
         return True
 
     def warmup_model(self):
@@ -876,8 +877,15 @@ class ModelRunner:
         input_ids, temperatures = self.prepare_model(batch)
         logits = self.run_model(input_ids)
         reset_forward_context()
-        return self.postprocess(batch, logits, temperatures)
+        tmp= self.postprocess(batch, logits, temperatures)
+        return tmp
+    @torch.inference_mode()
+    def test_async_proc_aggregation(self):
+        import os
+        res=f"kv_output: {os.getpid()=}:"
+        return res
 
+    
     @torch.inference_mode()
     def capture_cudagraph(self):
         start_time = time.time()

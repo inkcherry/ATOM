@@ -162,6 +162,8 @@ class EngineCore:
             logger.debug(f"{self.label}: No sequences to schedule, skipping forward")
             return False
         out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+        
+        out2=self.runner_mgr.call_func_with_aggregation("test_async_proc_aggregation")
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
