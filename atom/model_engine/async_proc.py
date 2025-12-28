@@ -42,8 +42,16 @@ class AsyncIOProc:
     ):
         self.label = f"AsyncIOProc({label})"
         self.io_addrs = io_addrs
+        
+        self.original_output_addr, self.aggregation_output_addr = io_addrs  
+        
+
         self.io_queues = queue.Queue(), queue.Queue()
+        self.aggregation_queue = queue.Queue()  
+
         self.io_threads = []
+        
+        
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
         # make sure exit handler is set before runner is created
         init_exit_handler(self)
@@ -58,6 +66,17 @@ class AsyncIOProc:
             t.start()
             self.io_threads.append(t)
 
+        if self.aggregation_output_addr:  
+            t = threading.Thread(  
+                target=self.send_output_to_socket,  
+                args=(self.aggregation_output_addr, self.aggregation_queue),  
+                daemon=True  
+            )  
+            t.start()  
+            self.io_threads.append(t)  
+        
+        
+        
         runner_class = resolve_obj_by_qualname(runner_qualname)  # type: ignore
         self.runners = []
         self.runners.append(runner_class(rank, *args, **kwargs))
@@ -141,6 +160,14 @@ class AsyncIOProcManager:
         init_exit_handler(self)
         for i in range(proc_num):
             label = f"ModelRunner{i}/{proc_num}"
+            
+            
+            original_addr = self.original_output_addr if i == 0 else None  
+            aggregation_addr = self.output_addrs[i]  
+            addrs = (original_addr, aggregation_addr)  
+
+            
+            
             addrs = (
                 [None, io_addrs[1]] if i == 0 else [None, None]
             )  # only get output from rank 0
@@ -167,9 +194,58 @@ class AsyncIOProcManager:
             args=(io_addrs[1],),
             daemon=True,
         )
+        
+        
+        
+        self.output_addrs = [get_open_zmq_ipc_path() for _ in range(proc_num)]  
+        self.outputs_queues = [queue.Queue() for _ in range(proc_num)]  
+        self.output_threads = []  
+        
+        
+        
         self.output_thread.start()
         self.monitor_procs()
 
+    def _init_aggregation_threads(self):  
+        """初始化聚合输出收集线程"""  
+        for i, output_addr in enumerate(self.output_addrs):  
+            output_thread = threading.Thread(  
+                target=self.process_output_sockets,  
+                name=f"{self.label}_agg_thread_{i}",  
+                args=(output_addr, i),  
+                daemon=True,  
+            )  
+            output_thread.start()  
+            self.output_threads.append(output_thread)
+            
+    def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):  
+        """新增：支持 KV 输出聚合的方法"""  
+        if self.kv_output_aggregator is None:  
+            self.kv_output_aggregator = KVOutputAggregator(  
+                expected_finished_count=self.proc_num  
+            )  
+          
+        logger.debug(f"{self.label}: call_func_with_aggregation {func_name} {args}")  
+        msg = (func_name, *args)  
+        self.rpc_broadcast_mq.enqueue(msg)  
+          
+        # 收集所有 worker 的输出  
+        worker_outputs = []  
+        for i, output_queue in enumerate(self.outputs_queues):  
+            try:  
+                output = output_queue.get(timeout=timeout)  
+                worker_outputs.append(output)  
+            except queue.Empty:  
+                logger.error(f"Timeout waiting for output from worker {i}")  
+                return None  
+          
+        # 使用聚合器合并输出  
+        if worker_outputs:  
+            return self.kv_output_aggregator.aggregate(worker_outputs, output_rank=0)  
+        return None
+    
+    
+    
     def exit(self):
         if not self.still_running:
             return
