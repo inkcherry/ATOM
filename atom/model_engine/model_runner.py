@@ -465,6 +465,7 @@ class ModelRunner:
         logger.debug(
             f"{self.label}: dummy batch executed with {num_input_tokens} tokens"
         )
+        #TODO , get connector
         return True
 
     def warmup_model(self):

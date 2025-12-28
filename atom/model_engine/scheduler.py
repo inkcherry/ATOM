@@ -10,7 +10,7 @@ from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
-from atom.disaggregation.kv_connector import MORIIO_KV_CONNECTOR
+from atom.disaggregation.kv_connector import MORIIO_KV_CONNECTOR, KVConnectorOutput
 logger = logging.getLogger("atom")
 
 
@@ -57,8 +57,9 @@ class ScheduledBatch:
         self.total_seqs_num = total_seqs_num
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
-
-  
+        
+        
+        self.finished_recving_kv_req_ids=[]
             
 
 class Scheduler:
@@ -75,7 +76,7 @@ class Scheduler:
         # Use a temporary deque to collect requests that need to be skipped
         # and put back at the head of the waiting queue later
         self.kv_connector=None
-        if True:
+        if False:
             config=None
             self.kv_connector = MORIIO_KV_CONNECTOR(config)
             
@@ -291,34 +292,56 @@ class Scheduler:
         return finished_seqs
     
 
-def _update_waiting_for_remote_kv(self, seq) -> bool:
-        """
-        P/D: check if the request_id is finished_recving.
-        The finished_recving_kv_req_ids list is populated
-        on the previous steps()'s update_from_output based
-        on the worker side connector.
-        When the kv transfer is ready, we cache the blocks
-        and the request state will be moved back to WAITING from
-        WAITING_FOR_REMOTE_KV.
-        """
-        # if seq.request_id not in self.finished_recving_kv_req_ids:
-        #     return False
+    def _update_waiting_for_remote_kv(self, seq) -> bool:
+            """
+            P/D: check if the request_id is finished_recving.
+            The finished_recving_kv_req_ids list is populated
+            on the previous steps()'s update_from_output based
+            on the worker side connector.
+            When the kv transfer is ready, we cache the blocks
+            and the request state will be moved back to WAITING from
+            WAITING_FOR_REMOTE_KV.
+            """
+            if seq.request_id not in self.finished_recving_kv_req_ids:
+                return False
 
-        # # Now that the blocks are ready, actually cache them.
-        # block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
-        
-        
-        # num_computed_tokens = len(block_ids) * self.block_size
-        # if num_computed_tokens == request.num_tokens:
-        #     num_computed_tokens -= 1
-        # self.kv_cache_manager.single_type_manager.cache_blocks(
-        #     request,
-        #     self.kv_cache_manager.req_to_block_hashes[request.request_id],
-        #     num_computed_tokens,
-        # )
-        # # Update the request state for scheduling.
-        # request.num_computed_tokens = num_computed_tokens
+            # # Now that the blocks are ready, actually cache them.
+            # block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+            
+            
+            # num_computed_tokens = len(block_ids) * self.block_size
+            # if num_computed_tokens == request.num_tokens:
+            #     num_computed_tokens -= 1
+            # self.kv_cache_manager.single_type_manager.cache_blocks(
+            #     request,
+            #     self.kv_cache_manager.req_to_block_hashes[request.request_id],
+            #     num_computed_tokens,
+            # )
+            # # Update the request state for scheduling.
+            # request.num_computed_tokens = num_computed_tokens
 
-        # # Return that we are ready.
-        # self.finished_recving_kv_req_ids.remove(req.request_id)
-        return True
+            # # Return that we are ready.
+            # self.finished_recving_kv_req_ids.remove(req.request_id)
+            return True
+
+    
+    def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
+        """
+        KV Connector: update the scheduler state based on the output.
+
+        The Worker side connectors add finished_recving and
+        finished_sending reqs to the output.
+        * if finished_sending: free the blocks
+        # if finished_recving: add to state so we can
+            schedule the request during the next step.
+        """
+
+
+        # KV Connector:: update recv and send status from last step.
+        for req_id in kv_connector_output.finished_recving or ():
+            logger.debug("Finished recving KV transfer for request %s", req_id)
+            self.finished_recving_kv_req_ids.add(req_id)
+        for req_id in kv_connector_output.finished_sending or ():
+            logger.debug("Finished sending KV transfer for request %s", req_id)
+            assert req_id in self.requests
+            self._free_blocks(self.requests[req_id])
