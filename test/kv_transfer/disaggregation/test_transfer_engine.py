@@ -99,6 +99,28 @@ class TestMoRIIOWrapper:
         assert w.done_req_ids == []
         assert w.done_write_cache_req_ids == []
         assert w.local_memory_registered is False
+        assert w.local_memory_descs == []
+
+    def test_register_local_buffer_returns_packed_and_records_desc(self):
+        """register_local_buffer should call engine.register_memory and
+        accumulate the returned MemoryDesc on local_memory_descs so the
+        registration isn't garbage-collected."""
+        w = MoRIIOWrapper()
+        engine = MagicMock()
+        fake_desc = MagicMock()
+        fake_desc.pack.return_value = b"packed-desc-bytes"
+        engine.register_memory.return_value = fake_desc
+        w.set_moriio_engine(engine)
+
+        packed_a = w.register_local_buffer(0xCAFE0000, 1 << 20, device_id=0)
+        packed_b = w.register_local_buffer(0xCAFE1000, 1 << 20, device_id=0)
+
+        assert packed_a == b"packed-desc-bytes"
+        assert packed_b == b"packed-desc-bytes"
+        assert engine.register_memory.call_count == 2
+        # both descs retained so RDMA registrations stay alive
+        assert w.local_memory_descs == [fake_desc, fake_desc]
+        assert w.local_memory_registered is True
 
     def test_set_moriio_engine_rejects_none(self):
         w = MoRIIOWrapper()

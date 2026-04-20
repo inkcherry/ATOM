@@ -77,6 +77,7 @@ try:
         IOEngine,
         IOEngineConfig,
         MemoryDesc,
+        MemoryLocationType,
     )
 
     _MORIIO_AVAILABLE = True
@@ -258,7 +259,11 @@ class MoRIIOWrapper:
 
         self.remote_memory_metadata: Any = None
         self.local_memory_registered: bool = False
-        self.local_memory_metadata: Any = None
+        # Raw-pointer registration produces multiple MemoryDesc per layer
+        # (e.g. K + V on MHA) to keep each ibv_reg_mr below the AINIC ~2 GiB
+        # limit. We retain handles here purely so they aren't GC'd; nothing
+        # in the active session/transfer path indexes into this list.
+        self.local_memory_descs: list[Any] = []
         self.transfer_status: list[Any] = []
         self.remote_engine_ip: str | None = None
         self.notify_port: int | None = None
@@ -296,20 +301,45 @@ class MoRIIOWrapper:
         )
         return consumer_engine_metadata.key
 
-    def register_local_tensor(self, tensor):
+    def register_local_buffer(self, ptr: int, size: int, device_id: int) -> bytes:
+        """Register one raw GPU memory region with MoRIIO.
+
+        Returns the packed ``MemoryDesc`` blob that downstream peers need
+        for handshake. The ``MemoryDesc`` object itself is retained on
+        ``self.local_memory_descs`` to keep the registration alive.
+
+        Using ``register_memory(ptr, size, ...)`` directly (instead of
+        ``register_torch_tensor``) lets callers split a single tensor into
+        multiple smaller regions, which is required to stay under the
+        AINIC ~2 GiB ``ibv_reg_mr`` limit.
+        """
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
         try:
-            self.local_memory_metadata = self.moriio_engine.register_torch_tensor(
-                tensor
+            desc = self.moriio_engine.register_memory(
+                ptr, size, device_id, MemoryLocationType.GPU
             )
-            assert (
-                self.local_memory_metadata is not None
-            ), "register_torch_tensor returned None"
-            local_memory_metadata_packed = self.local_memory_metadata.pack()
+            assert desc is not None, "register_memory returned None"
+            packed = desc.pack()
         except Exception as e:
             raise ValueError(f"Failed to register local memory: {e}") from e
+        self.local_memory_descs.append(desc)
         self.local_memory_registered = True
-        return local_memory_metadata_packed
+        return packed
+
+    def register_local_tensor(self, tensor):
+        """Back-compat helper: register an entire contiguous torch tensor.
+
+        Prefer :meth:`register_local_buffer` from new code so that callers
+        explicitly choose how to chunk large tensors before registration.
+        """
+        if not tensor.is_contiguous():
+            raise RuntimeError("input tensor must be contiguous")
+        ptr = tensor.data_ptr()
+        size = tensor.numel() * tensor.element_size()
+        device_id = (
+            tensor.device.index if tensor.device.index is not None else -1
+        )
+        return self.register_local_buffer(ptr, size, device_id)
 
     def get_unpack_memory_metadata(self, packed_memory_metadata):
         return MemoryDesc.unpack(packed_memory_metadata)
@@ -631,6 +661,16 @@ class KVConnector(KVConnectorBase):
 
         Must be called after model loading and KV cache allocation, before any
         transfers can occur.
+
+        On MHA (5-D ``cache_tensor`` of shape ``(2, num_blocks, block_size,
+        num_kv_heads, head_size)``), K and V are registered as **two**
+        separate raw-pointer regions per layer, each ~half of the original
+        tensor. This is required because the AINIC RDMA stack rejects
+        ``ibv_reg_mr`` calls above ~2 GiB (errno EINVAL); a typical
+        per-layer ``cache_tensor`` is well over 2 GiB but each K/V half
+        comfortably fits.
+
+        On MLA (3-D ``cache_tensor``) only one region per layer is needed.
         """
         self.kv_caches = kv_caches
         cache_tensor = None
@@ -639,18 +679,48 @@ class KVConnector(KVConnectorBase):
             cache_tensor = kv_cache.k_cache
             if self.kv_cache_shape is None:
                 self.kv_cache_shape = cache_tensor.shape
-            if layer_name not in self.layer_name_to_local_kv_cache_metadata:
-                self.layer_name_to_local_kv_cache_metadata[layer_name] = []
 
-            packed_meta = self.moriio_wrapper.register_local_tensor(cache_tensor)
-            self.layer_name_to_local_kv_cache_metadata[layer_name].append(packed_meta)
+            sz = cache_tensor.element_size()
+            device_id = (
+                cache_tensor.device.index
+                if cache_tensor.device.index is not None
+                else -1
+            )
+
+            if cache_tensor.dim() == 5:
+                # MHA: split K (cache_tensor[0]) and V (cache_tensor[1])
+                # into two independent MoRIIO registrations.
+                assert cache_tensor.is_contiguous(), (
+                    "MHA cache_tensor must be contiguous for K/V split "
+                    "registration"
+                )
+                base_ptr = cache_tensor.data_ptr()
+                half_bytes = cache_tensor[0].numel() * sz
+                stride0_bytes = cache_tensor.stride(0) * sz
+                packed_k = self.moriio_wrapper.register_local_buffer(
+                    base_ptr, half_bytes, device_id
+                )
+                packed_v = self.moriio_wrapper.register_local_buffer(
+                    base_ptr + stride0_bytes, half_bytes, device_id
+                )
+                self.layer_name_to_local_kv_cache_metadata[layer_name] = [
+                    packed_k,
+                    packed_v,
+                ]
+            else:
+                # MLA: single region per layer.
+                nbytes = cache_tensor.numel() * sz
+                packed = self.moriio_wrapper.register_local_buffer(
+                    cache_tensor.data_ptr(), nbytes, device_id
+                )
+                self.layer_name_to_local_kv_cache_metadata[layer_name] = [packed]
 
         # Extract block geometry from the last registered tensor
         if len(cache_tensor.shape) == 5:
-            self.num_blocks, _num_kv_heads, _, self.block_len, _ = cache_tensor.shape
+            # (2, num_blocks, block_size, num_kv_heads, head_size)
+            _, self.num_blocks, self.block_len, _num_kv_heads, _ = cache_tensor.shape
         else:
             self.num_blocks, self.block_len, _hs = cache_tensor.shape
-        self.num_blocks = cache_tensor.shape[0]
         metadata = MoRIIOAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.moriio_wrapper.get_agent_metadata(),
@@ -830,66 +900,75 @@ class KVConnector(KVConnectorBase):
         remote_moriio_meta: MoRIIOAgentMetadata,
     ) -> tuple[list[int], list[int], list[int]]:
         """Compute transfer offsets for block data.
+
+        With the K/V split registration, K and V each live in their own
+        registered region whose base address corresponds to block 0. So
+        the byte offset of block ``b`` is simply ``b * block_stride * sz``
+        within either the K-side or the V-side session — caller iterates
+        over the per-layer session list to apply the same offsets to both.
+
         Args:
             layer_name: Name of the layer to transfer
             local_block_ids: IDs of local blocks
             remote_block_ids: IDs of remote blocks
-            remote_moriio_meta: Metadata of the remote MoRIIO agent
+            remote_moriio_meta: Metadata of the remote MoRIIO agent (kept
+                in the signature for forward-compat / debugging; the
+                K/V-split layout no longer depends on remote num_blocks).
         Returns:
-            Tuple of (local_offsets, remote_offsets, transfer_sizes)
+            Tuple of (local_offsets, remote_offsets, transfer_sizes),
+            shared across K and V sessions on MHA.
         """
+        del remote_moriio_meta  # unused since K/V split removed ktov_stride
         assert self.kv_cache_shape is not None, "KV caches shape not initialized"
         is_mla = len(self.kv_cache_shape) == 3
-        stride = self.kv_caches[layer_name].k_cache.stride()
-        sz = self.kv_caches[layer_name].k_cache.element_size()
+        cache_tensor = self.kv_caches[layer_name].k_cache
+        sz = cache_tensor.element_size()
         if is_mla:
-            blknum, blksize, hs = self.kv_cache_shape
-            hn = 1
-            block_stride = stride[0]
+            # (num_blocks, block_size, head_size) -> stride(0) is per-block
+            block_stride = cache_tensor.stride(0)
         else:
-            _, blknum, blksize, hn, hs = self.kv_cache_shape
-            local_ktov_stride = stride[0]
-            block_stride = stride[1]
-            remote_ktov_stride = block_stride * remote_moriio_meta.num_blocks
+            # (2, num_blocks, block_size, num_kv_heads, head_size); after
+            # K/V split, each registered region IS cache_tensor[0] (or
+            # [1]), whose per-block stride is the original stride(1).
+            block_stride = cache_tensor.stride(1)
 
-        transfer_size_byte = blksize * hn * hs * sz
-        per_block = 1 if is_mla else 2
-        total = len(local_block_ids) * per_block
-        offset_local = [0] * total
-        offset_remote = [0] * total
-        sizes = [transfer_size_byte] * total
-
-        w = 0
-        for i, lb in enumerate(local_block_ids):
-            rb = remote_block_ids[i]
-            # K
-            offset_local[w] = sz * (lb * block_stride)
-            offset_remote[w] = sz * (rb * block_stride)
-            w += 1
-            if not is_mla:
-                # Handle num_block variations originating from PD (different kv strides)
-                # TODO: address block_sz differences in heterogeneous TP scenarios
-                # In MLA, we don't need to consider these two cases.
-                offset_local[w] = sz * (1 * local_ktov_stride + lb * block_stride)
-                offset_remote[w] = sz * (1 * remote_ktov_stride + rb * block_stride)
-                w += 1
-
-        merged_l, merged_r, merged_s = offset_local, offset_remote, sizes
-        return merged_l, merged_r, merged_s
+        transfer_size_byte = block_stride * sz
+        n = len(local_block_ids)
+        offset_local = [sz * lb * block_stride for lb in local_block_ids]
+        offset_remote = [sz * rb * block_stride for rb in remote_block_ids]
+        sizes = [transfer_size_byte] * n
+        return offset_local, offset_remote, sizes
 
     def _get_or_build_sessions(
         self, remote_engine_id: str
-    ) -> tuple[list[Any], MoRIIOAgentMetadata]:
-        """Return cached RDMA sessions for the remote engine, building if needed."""
+    ) -> tuple[list[list[Any]], MoRIIOAgentMetadata]:
+        """Return cached RDMA sessions for the remote engine, building if needed.
+
+        With the K/V split registration, each layer carries N descriptors
+        (1 on MLA, 2 on MHA — K then V). We therefore return a
+        ``list[list[session]]`` whose outer index is the layer ordinal and
+        whose inner list is one session per (local desc, remote desc)
+        pair, in the same order they were appended during registration.
+        """
         if remote_engine_id not in self._built_sessions:
-            sessions = []
-            for ln, local_meta in self.layer_name_to_local_kv_cache_metadata.items():
-                local_md = self.moriio_wrapper.get_unpack_memory_metadata(local_meta[0])
-                remote_md = self.moriio_wrapper.get_unpack_memory_metadata(
-                    self.layer_name_to_remote_kv_cache_metadata[remote_engine_id][ln][0]
+            per_layer_sessions: list[list[Any]] = []
+            for ln, local_metas in self.layer_name_to_local_kv_cache_metadata.items():
+                remote_metas = self.layer_name_to_remote_kv_cache_metadata[
+                    remote_engine_id
+                ][ln]
+                assert len(local_metas) == len(remote_metas), (
+                    f"layer {ln}: local has {len(local_metas)} descs, "
+                    f"remote has {len(remote_metas)} — K/V split mismatch"
                 )
-                sessions.append(self.moriio_wrapper.build_session(local_md, remote_md))
-            self._built_sessions[remote_engine_id] = sessions
+                sess_list: list[Any] = []
+                for lpacked, rpacked in zip(local_metas, remote_metas):
+                    local_md = self.moriio_wrapper.get_unpack_memory_metadata(lpacked)
+                    remote_md = self.moriio_wrapper.get_unpack_memory_metadata(rpacked)
+                    sess_list.append(
+                        self.moriio_wrapper.build_session(local_md, remote_md)
+                    )
+                per_layer_sessions.append(sess_list)
+            self._built_sessions[remote_engine_id] = per_layer_sessions
 
         return (
             self._built_sessions[remote_engine_id],
@@ -940,15 +1019,20 @@ class KVConnector(KVConnectorBase):
 
         layer_names = list(self.layer_name_to_local_kv_cache_metadata.keys())
         for layer_idx, layer_name in enumerate(layer_names):
-            transfer_status = self.moriio_wrapper.read_remote_data(
-                offsets[2], offsets[0], offsets[1], sessions[layer_idx]
-            )
-            with self.moriio_wrapper.lock:
-                self._recving_transfers[request_id].append(transfer_status)
-                self._recving_transfers_callback_addr[request_id] = (
-                    remote_host,
-                    str(notify_port),
+            # sessions[layer_idx] is a list of per-region sessions:
+            # [K_session] for MLA, [K_session, V_session] for MHA. K and V
+            # use the same (local_offset, remote_offset, size) tuple
+            # because each region's offset 0 corresponds to block 0.
+            for sess in sessions[layer_idx]:
+                transfer_status = self.moriio_wrapper.read_remote_data(
+                    offsets[2], offsets[0], offsets[1], sess
                 )
+                with self.moriio_wrapper.lock:
+                    self._recving_transfers[request_id].append(transfer_status)
+                    self._recving_transfers_callback_addr[request_id] = (
+                        remote_host,
+                        str(notify_port),
+                    )
 
         logger.debug(
             "RDMA read issued for req %s (%d layers) from %s (dp_rank=%d, notify_port=%d)",
