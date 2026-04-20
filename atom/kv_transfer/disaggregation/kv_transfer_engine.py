@@ -987,12 +987,21 @@ class KVConnector(KVConnectorBase):
     ) -> None:
         """Issue RDMA reads for all layers of a single request.
 
-        Virtual block IDs are expanded to physical pages before computing
-        byte offsets.  Transfer statuses are stored for later polling in
+        ``local_block_ids`` / ``remote_block_ids`` arrive as block-level
+        IDs (``0..num_blocks-1``) that index the same dimension as
+        ``cache_tensor.stride(1)`` (MHA) or ``cache_tensor.stride(0)``
+        (MLA) — no virtual→physical expansion is needed. Earlier code
+        unconditionally expanded each ID into 16 token-level slots via
+        ``convert_virtual_to_physical_pages(ids, 16, 1)``, which then
+        combined with the block-level stride to produce offsets ~16× the
+        registered MR length and trip ``length out of range`` in
+        mori's RdmaBatchReadWrite. The expansion was a no-op only when
+        the registered region happened to be ≥16× the real cache, which
+        was never true. Remove it so offsets stay inside the MR.
+
+        Transfer statuses are stored for later polling in
         :meth:`_pop_done_transfers`.
         """
-        local_block_ids = convert_virtual_to_physical_pages(local_block_ids)
-        remote_block_ids = convert_virtual_to_physical_pages(remote_block_ids)
 
         logger.debug(
             "Reading %d blocks for req %s from %s (tp_rank=%d, remote_dp_rank=%d)",
